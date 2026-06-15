@@ -1,0 +1,2 @@
+"""AI PDF Assistant package."""
+
