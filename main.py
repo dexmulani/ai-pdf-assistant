@@ -1,65 +1,116 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
 import fitz  # PyMuPDF
+import os
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from dotenv import load_dotenv
 import ollama
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+import io
+
+# Load environment variables
+load_dotenv()
 
 app = FastAPI()
+
+# Thread pool for running blocking Ollama calls without freezing the server
+executor = ThreadPoolExecutor(max_workers=4)
+
+
+# ─────────────────────────────────────────────
+# Helper: Run Ollama in a separate thread
+# ─────────────────────────────────────────────
+def run_ollama(text: str) -> str:
+    response = ollama.chat(
+        model="llama3.2",
+        messages=[
+            {
+                "role": "user",
+                "content": f"Summarize this text in a clear and concise way:\n\n{text[:4000]}"
+            }
+        ]
+    )
+    return response["message"]["content"]
 
 
 @app.get("/")
 def home():
-    return {
-        "message": "AI PDF Assistant is running with Ollama!"
-    }
+    return {"message": "AI PDF Assistant is running!"}
 
 
-@app.get("/test-ai")
-def test_ai():
-    response = ollama.chat(
-        model="llama3.1:8b",
-        messages=[
-            {
-                "role": "user",
-                "content": "Reply with exactly: AI connection successful!"
-            }
-        ]
-    )
-
-    return {
-        "response": response["message"]["content"]
-    }
-
-
+# ─────────────────────────────────────────────
+# 1. UPLOAD & SUMMARIZE
+# ─────────────────────────────────────────────
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...)):
-    # Read the uploaded PDF
-    pdf_bytes = await file.read()
+    try:
+        pdf_bytes = await file.read()
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        page_count = len(doc)
 
-    # Open it with PyMuPDF
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        # Extract text from all pages
+        extracted_text = ""
+        for page in doc:
+            extracted_text += page.get_text()
+        doc.close()
 
-    extracted_text = ""
-    for page in doc:
-        extracted_text += page.get_text()
+        # Run Ollama in thread pool — won't block other requests
+        loop = asyncio.get_event_loop()
+        summary = await loop.run_in_executor(executor, run_ollama, extracted_text)
 
-    doc.close()
+        return {
+            "filename": file.filename,
+            "pages": page_count,
+            "extracted_text": extracted_text,  # full text for editing
+            "summary": summary
+        }
 
-    # Keep only the first part to avoid sending too much text
-    prompt = (
-        "Summarize the following PDF in simple bullet points:\n\n"
-        + extracted_text[:5000]
-    )
+    except Exception as e:
+        return {"error": f"An error occurred: {str(e)}"}
 
-    response = ollama.chat(
-        model="llama3.1:8b",
-        messages=[
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
-    )
 
-    return {
-        "filename": file.filename,
-        "summary": response["message"]["content"]
-    }
+# ─────────────────────────────────────────────
+# 2. EDIT & DOWNLOAD AS PDF
+# ─────────────────────────────────────────────
+@app.post("/download-edited-pdf")
+async def download_edited_pdf(
+    edited_text: str = Form(...),
+    filename: str = Form("edited_document")
+):
+    try:
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=letter,
+            rightMargin=50,
+            leftMargin=50,
+            topMargin=60,
+            bottomMargin=60
+        )
+        styles = getSampleStyleSheet()
+        story = []
+
+        # Split by newline and add each line as a paragraph
+        for line in edited_text.split("\n"):
+            if line.strip() == "":
+                story.append(Spacer(1, 8))
+            else:
+                story.append(Paragraph(line.strip(), styles["Normal"]))
+                story.append(Spacer(1, 4))
+
+        doc.build(story)
+        buffer.seek(0)
+
+        safe_filename = filename.replace(".pdf", "") + "_edited.pdf"
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={safe_filename}"}
+        )
+
+    except Exception as e:
+        return {"error": f"Failed to generate PDF: {str(e)}"}
